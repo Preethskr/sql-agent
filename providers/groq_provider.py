@@ -89,3 +89,11 @@ class GroqProvider(BaseProvider):
             return ProviderResponse(stop_reason="tool_use", tool_calls=tool_calls)
 
         return ProviderResponse(stop_reason=finish_reason)
+
+    def complete_text(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model      = self._model,
+            max_tokens = 1024,
+            messages   = [{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content

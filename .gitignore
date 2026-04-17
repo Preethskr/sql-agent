@@ -4,6 +4,9 @@
 # Logs
 logs/
 
+# Sessions
+sessions/
+
 
 # Python
 __pycache__/

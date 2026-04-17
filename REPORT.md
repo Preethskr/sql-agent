@@ -289,30 +289,112 @@ LLM_PROVIDER=gemini      # free dev    — Gemini 2.0 Flash
 
 ---
 
-## 11. Stateful Conversation
+## 11. Stateful Conversation with Bounded Memory
 
-The agent maintains full conversation history across turns. The Anthropic API (and all
-LLM APIs) are stateless — they have no memory between calls. Statefulness is implemented
-by appending every message to a list and sending the complete history with each request.
+LLM APIs are stateless — they have no memory between calls. Statefulness is implemented
+by maintaining a message history and sending it with every request. The challenge is
+that history grows linearly with conversation length, eventually hitting context limits
+and increasing cost.
 
-```python
-self.messages: list[dict] = []   # grows with every turn
+This system implements a **hybrid sliding window + summarization** strategy managed
+by the `ConversationMemory` class in `memory.py`.
 
-# Turn 1
-messages.append({"role": "user", "content": "Show delayed orders"})
-response = provider.complete(system, messages, tools)   # history sent
+### How it works
 
-# Turn 2 — user references Turn 1
-messages.append({"role": "user", "content": "Now filter that by carrier DHL"})
-response = provider.complete(system, messages, tools)   # full history sent again
+```
+Turns 1–20:   Full history kept in memory
+              messages = [msg1, msg2, ... msg20]
+
+Turn 21:      Threshold (20) exceeded — compression triggered:
+              - messages[:-10] sent to LLM for summarization
+              - Summary stored separately
+              - messages = messages[-10:]  (window slides forward)
+              - Summary injected into system prompt for next request
+
+Turn 31:      Threshold exceeded again:
+              - New old messages summarized and merged with existing summary
+              - Window slides again
 ```
 
-The agent can answer follow-up questions that reference previous results. This is
-essential for a real business analyst workflow.
+### Key design decision: summary goes in the system prompt, not the message list
 
-**Production consideration:** As conversations grow, token usage grows linearly.
-In production this would require a sliding window or summarisation strategy.
-For this demo it is intentionally left simple.
+```python
+def get_system(self, base_system: str) -> str:
+    if not self.summary:
+        return base_system
+    return (
+        base_system
+        + "\n\n## PREVIOUS CONVERSATION CONTEXT\n"
+        + self.summary
+    )
+```
+
+Injecting the summary into the system prompt is cleaner than inserting fake
+`user`/`assistant` messages into the history. It keeps the message list structurally
+clean and avoids confusing the LLM with synthetic conversation turns.
+
+### Normalized message format
+
+All providers receive history in the same normalized format:
+
+```python
+{"role": "user",        "content": "show delayed orders"}
+{"role": "assistant",   "text": None, "tool_calls": [{"id": "1", "name": "list_schemas", "input": {}}]}
+{"role": "tool_result", "tool_call_id": "1", "tool_name": "list_schemas", "content": "..."}
+{"role": "assistant",   "text": "Here are the results...", "tool_calls": []}
+```
+
+Each provider (`AnthropicProvider`, `GroqProvider`, `GeminiProvider`) converts this
+normalized format to its own API-specific format on every call. The agent never handles
+provider-specific message structures directly.
+
+### Session persistence
+
+Conversations are persisted across restarts via a pluggable `ConversationStore`:
+
+```
+STORE_TYPE=json      → sessions/<session_id>.json   (development)
+STORE_TYPE=postgres  → agent_sessions table          (production)
+```
+
+**JSON store** uses atomic writes (write to `.tmp`, then `os.replace()`) to prevent
+corrupt session files on crash.
+
+**PostgreSQL store** uses `INSERT ... ON CONFLICT DO UPDATE` (upsert) so every
+`save()` is idempotent — safe to call after every turn.
+
+```sql
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    session_id  VARCHAR(8)   PRIMARY KEY,
+    created_at  TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  DEFAULT NOW(),
+    summary     TEXT,
+    messages    JSONB        NOT NULL DEFAULT '[]',
+    turn_count  INTEGER      DEFAULT 0
+);
+```
+
+Messages are stored as `JSONB`, making them queryable if needed for auditing.
+
+### Session management CLI commands
+
+```
+sessions           → list all saved sessions with preview of first question
+resume a1b2c3d4    → restore a previous session (history + summary restored)
+reset              → clear history, generate new session ID
+```
+
+On `resume`, the session summary is displayed so the user immediately sees what
+was discussed previously before continuing.
+
+### What this solves in production
+
+| Problem | Solution |
+|---|---|
+| Context window limits | Sliding window caps active history at 10 messages |
+| Token cost growth | Old turns compressed to ~200-word summary |
+| Lost state on restart | JSON / PostgreSQL persistence |
+| Multi-session workflows | Session IDs allow resuming any past conversation |
 
 ---
 
@@ -387,7 +469,9 @@ of unexpected LLM behaviour.
 | Human-in-the-loop | `tools.py` — `_request_human_approval()` |
 | Errors as data | All tool functions return dicts, never raise |
 | Dynamic prompt templating | `agent.py` — `load_system_prompt()` |
-| Stateful conversation | `agent.py` — `self.messages` list |
+| Hybrid sliding window + summarization | `memory.py` — `ConversationMemory` |
+| Pluggable session persistence | `memory.py` — `JsonStore` / `PostgresStore` |
+| Normalized message history | `providers/base.py` — provider-agnostic format |
 | Connection resilience | `agent.py` — `_ensure_connection()` |
 | Structured logging | `logger.py` — JSONL rotating file |
 | Prompt as versioned artifact | `system_prompt.md` — separate from code |
@@ -396,16 +480,21 @@ of unexpected LLM behaviour.
 
 ## 16. What Would Be Added in Production
 
-| Gap | Production Solution |
-|---|---|
-| Token growth in long conversations | Sliding window or LLM-based summarisation |
-| Single-user CLI | FastAPI REST endpoints or Streamlit UI |
-| Hardcoded credentials in .env | Secrets manager (AWS Secrets Manager, Vault) |
-| No authentication | OAuth2 / SSO integration |
-| No query caching | Cache frequent query results (Redis) |
-| No cost tracking | Token usage logging per session |
-| Single-threaded | Async tool dispatch for parallel tool calls |
-| No schema versioning | Schema change detection + prompt invalidation |
+| Gap | Status | Production Solution |
+|---|---|---|
+| Token growth in long conversations | **Built** — sliding window + summarization | Tune window/threshold per use case |
+| Session persistence | **Built** — JSON (dev) + PostgreSQL (prod) | Already implemented via `STORE_TYPE` |
+| Single-user CLI | Gap | FastAPI REST endpoints or Streamlit UI |
+| Hardcoded credentials in .env | Gap | Secrets manager (AWS Secrets Manager, Vault) |
+| No authentication | Gap | OAuth2 / SSO integration |
+| No query caching | Gap | Cache frequent query results (Redis) |
+| No cost tracking | Gap | Token usage logging per session |
+| Single-threaded | Gap | Async tool dispatch for parallel tool calls |
+| No schema versioning | Gap | Schema change detection + prompt invalidation |
+
+---
+
+*Built with: Python 3.10, Anthropic SDK, google-genai, groq, psycopg2, oracledb, pyodbc, Rich*
 
 ---
 

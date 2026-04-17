@@ -133,3 +133,11 @@ class GeminiProvider(BaseProvider):
 
         text = next((p.text for p in parts if hasattr(p, "text") and p.text), None)
         return ProviderResponse(stop_reason="end_turn", text=text)
+
+    def complete_text(self, prompt: str) -> str:
+        response = self.client.models.generate_content(
+            model    = self._model,
+            contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+            config   = types.GenerateContentConfig(max_output_tokens=1024)
+        )
+        return response.candidates[0].content.parts[0].text

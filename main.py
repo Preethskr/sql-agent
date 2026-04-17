@@ -2,8 +2,10 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table
+from rich import box
 
-from config import DB_TYPE, LLM_PROVIDER
+from config import DB_TYPE, LLM_PROVIDER, STORE_TYPE
 from adapters import get_adapter
 from providers import get_provider
 from agent import SQLAgent
@@ -17,9 +19,34 @@ Ask questions about your logistics data in plain English.
 
 **Commands:**
 - Type your question and press Enter
-- `reset` — clear conversation history and start fresh
-- `exit`  — quit
+- `sessions`          — list previous sessions
+- `resume <id>`       — continue a previous session
+- `reset`             — clear history and start fresh
+- `exit`              — quit
 """
+
+
+def _show_sessions(agent: SQLAgent) -> None:
+    sessions = agent.list_sessions()
+    if not sessions:
+        console.print("[dim]No saved sessions found.[/dim]")
+        return
+
+    table = Table(box=box.ROUNDED, header_style="bold magenta", border_style="blue")
+    table.add_column("Session ID", style="cyan")
+    table.add_column("Last Active")
+    table.add_column("Turns", justify="right")
+    table.add_column("First Question")
+
+    for s in sessions:
+        table.add_row(
+            s["session_id"],
+            s["updated_at"][:19].replace("T", " "),
+            str(s["turn_count"]),
+            s["preview"]
+        )
+
+    console.print(Panel(table, title="[blue]Saved Sessions[/blue]", border_style="blue"))
 
 
 def main():
@@ -47,13 +74,19 @@ def main():
     # --- Initialise LLM provider ---
     try:
         provider = get_provider()
-        console.print(f"[dim]LLM:     [/dim]  [bold]{LLM_PROVIDER} / {provider.model_name}[/bold]\n")
+        console.print(
+            f"[dim]LLM:[/dim]       [bold]{LLM_PROVIDER} / {provider.model_name}[/bold]"
+        )
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         return
 
     # --- Initialise agent ---
     agent = SQLAgent(conn, adapter, provider)
+    console.print(
+        f"[dim]Session:[/dim]   [bold cyan]{agent.session_id}[/bold cyan]  "
+        f"[dim](store: {STORE_TYPE})[/dim]\n"
+    )
 
     # --- Conversation loop ---
     while True:
@@ -69,6 +102,28 @@ def main():
 
             if user_input.lower() == "reset":
                 agent.reset()
+                console.print(f"[dim]New session ID:[/dim] [cyan]{agent.session_id}[/cyan]")
+                continue
+
+            if user_input.lower() == "sessions":
+                _show_sessions(agent)
+                continue
+
+            if user_input.lower().startswith("resume "):
+                session_id = user_input.split(maxsplit=1)[1].strip()
+                if agent.resume(session_id):
+                    console.print(
+                        f"[green]Resumed session[/green] [cyan]{session_id}[/cyan] "
+                        f"([bold]{agent.memory.turn_count}[/bold] previous turns)"
+                    )
+                    if agent.memory.summary:
+                        console.print(Panel(
+                            agent.memory.summary,
+                            title="[dim]Conversation Summary[/dim]",
+                            border_style="dim"
+                        ))
+                else:
+                    console.print(f"[red]Session '{session_id}' not found.[/red]")
                 continue
 
             console.print()
@@ -76,7 +131,7 @@ def main():
 
             console.print(Panel(
                 Markdown(response),
-                title="[bold green]Agent[/bold green]",
+                title=f"[bold green]Agent[/bold green] [dim]· turn {agent.memory.turn_count}[/dim]",
                 border_style="green"
             ))
 

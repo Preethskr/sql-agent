@@ -78,3 +78,11 @@ class AnthropicProvider(BaseProvider):
             return ProviderResponse(stop_reason="tool_use", tool_calls=tool_calls)
 
         return ProviderResponse(stop_reason=response.stop_reason)
+
+    def complete_text(self, prompt: str) -> str:
+        response = self.client.messages.create(
+            model      = self._model,
+            max_tokens = 1024,
+            messages   = [{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text

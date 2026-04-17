@@ -150,3 +150,52 @@ The agent has tools like list_tables, search_tables_by_keyword, describe_table �
   - Guardrails: row cap, timeout, cardinality check, error recovery with 3 retries
   - Clean separation: config / tools / agent / UI — each file does one thing
 
+  Problem 1: Context Window Growth
+
+  History grows every turn. Eventually you hit the token limit.
+
+  Solutions:
+  Option A: Sliding window     → keep only last N messages
+  Option B: Summarisation      → LLM summarises old turns into one message
+  Option C: RAG over history   → embed history, retrieve relevant past turns
+
+  Problem 2: Session Identity
+
+  How do you know which conversation belongs to which user?
+
+  session_id = str(uuid.uuid4())   # we already do this in logger.py
+  # In production: tie session_id to authenticated user
+
+  Problem 3: Persistence Across Restarts
+
+  In-memory state dies when the process dies.
+
+  Solutions:
+  Option A: Serialize to JSON file (simple, single user)
+  Option B: Redis / Memcached   (fast, multi-user, ephemeral)
+  Option C: PostgreSQL / SQLite (durable, queryable history) - Production enterprise
+
+  How the hybrid memory works:
+
+  Turn 1–20:   Full history kept  →  [msg1, msg2, ... msg20]
+
+  Turn 21:     Threshold exceeded →  summarize msg1–msg10
+               Window slides      →  [SUMMARY injected in system prompt] + [msg11–msg20]
+
+  Turn 31:     Threshold exceeded again
+               →  summarize msg11–msg20 + merge with existing summary
+               →  [UPDATED SUMMARY] + [msg21–msg30]
+
+
+                The summary is injected into the system prompt, not the message list — this is cleaner than inserting fake user/assistant messages.
+
+  ---
+  New CLI commands:
+  sessions           → list all saved sessions with preview
+  resume a1b2c3d4    → continue a previous conversation (shows summary)
+  reset              → clear history, start fresh session
+
+  ---
+  Switch to PostgreSQL in production — one line:
+  STORE_TYPE=postgres
+  The table is created automatically on first run. No migrations needed.

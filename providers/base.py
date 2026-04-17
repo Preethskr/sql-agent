@@ -60,3 +60,10 @@ class BaseProvider(ABC):
     @abstractmethod
     def model_name(self) -> str:
         """Return the model identifier string for display."""
+
+    @abstractmethod
+    def complete_text(self, prompt: str) -> str:
+        """
+        Simple single-turn text completion — no tools, no history.
+        Used for conversation summarization.
+        """

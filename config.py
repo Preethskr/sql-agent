@@ -37,5 +37,18 @@ MAX_ITERATIONS    = int(os.getenv("MAX_ITERATIONS", "10"))
 QUERY_TIMEOUT     = int(os.getenv("QUERY_TIMEOUT", "10"))
 CARDINALITY_LIMIT = int(os.getenv("CARDINALITY_LIMIT", "50"))
 
+# --- Conversation Memory ---
+STORE_TYPE                 = os.getenv("STORE_TYPE", "json")          # json | postgres
+SESSIONS_DIR               = os.getenv("SESSIONS_DIR", "sessions")
+SESSIONS_WINDOW_SIZE       = int(os.getenv("SESSIONS_WINDOW_SIZE", "10"))
+SESSIONS_SUMMARY_THRESHOLD = int(os.getenv("SESSIONS_SUMMARY_THRESHOLD", "20"))
+
+# PostgreSQL sessions store (production only)
+SESSIONS_DB_HOST     = os.getenv("SESSIONS_DB_HOST", "localhost")
+SESSIONS_DB_PORT     = os.getenv("SESSIONS_DB_PORT", "5432")
+SESSIONS_DB_NAME     = os.getenv("SESSIONS_DB_NAME", "agent_sessions")
+SESSIONS_DB_USER     = os.getenv("SESSIONS_DB_USER", "")
+SESSIONS_DB_PASSWORD = os.getenv("SESSIONS_DB_PASSWORD", "")
+
 # --- Runtime ---
 CURRENT_DATE = date.today().isoformat()

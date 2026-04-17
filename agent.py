@@ -1,6 +1,5 @@
 import json
 import os
-import uuid
 
 from rich.console import Console
 from rich.panel import Panel
@@ -10,6 +9,7 @@ from rich import box
 from config import MAX_ITERATIONS, DB_TYPE, CURRENT_DATE, ROW_LIMIT, MAX_RETRIES, LLM_PROVIDER
 from adapters.base import BaseAdapter
 from providers.base import BaseProvider
+from memory import ConversationMemory
 from tools import TOOL_DEFINITIONS, dispatch_tool
 from logger import log
 
@@ -55,11 +55,9 @@ def _display_tool_result(name: str, result: dict) -> None:
             border_style="red"
         ))
         return
-
     if name == "execute_sql" and result.get("status") == "success" and result.get("columns"):
         _display_sql_table(result)
         return
-
     console.print(Panel(
         json.dumps(result, indent=2, default=str),
         title="[green]Tool Result[/green]",
@@ -88,9 +86,10 @@ class SQLAgent:
     """
     Stateful text-to-SQL agent.
 
-    Maintains a normalized message history that any provider can consume.
-    The provider handles all LLM-specific formatting internally.
-    The adapter handles all database-specific logic internally.
+    State is managed by ConversationMemory which handles:
+    - Sliding window (last N messages kept in full)
+    - Summarization of older turns (injected into system prompt)
+    - Persistence to JSON (dev) or PostgreSQL (production)
     """
 
     def __init__(self, conn, adapter: BaseAdapter, provider: BaseProvider):
@@ -98,69 +97,92 @@ class SQLAgent:
         self.adapter  = adapter
         self.provider = provider
         self.system   = load_system_prompt()
-        self.messages: list[dict] = []
-        self.session_id = str(uuid.uuid4())[:8]
+        self.memory   = ConversationMemory(provider)
 
         log.info("session.start", extra={
-            "session_id": self.session_id,
+            "session_id": self.memory.session_id,
             "provider":   LLM_PROVIDER,
             "model":      provider.model_name,
             "db_type":    DB_TYPE
         })
 
+    @property
+    def session_id(self) -> str:
+        return self.memory.session_id
+
+    def resume(self, session_id: str) -> bool:
+        """Load a previous session. Returns True if found."""
+        found = self.memory.load(session_id)
+        if found:
+            log.info("session.resumed", extra={
+                "session_id": session_id,
+                "turn_count": self.memory.turn_count
+            })
+        return found
+
+    def list_sessions(self) -> list[dict]:
+        return self.memory.list_sessions()
+
     def _ensure_connection(self) -> None:
         if not self.adapter.is_alive(self.conn):
             console.print("[yellow]Connection lost — reconnecting...[/yellow]")
-            log.warning("db.reconnect", extra={"session_id": self.session_id, "db_type": DB_TYPE})
+            log.warning("db.reconnect", extra={"session_id": self.session_id})
             self.conn = self.adapter.connect()
             console.print("[green]Reconnected.[/green]")
-            log.info("db.reconnected", extra={"session_id": self.session_id})
 
     def chat(self, user_message: str) -> str:
-        turn_id = str(uuid.uuid4())[:8]
+        self.memory.add({"role": "user", "content": user_message})
 
         log.info("turn.start", extra={
             "session_id": self.session_id,
-            "turn_id":    turn_id,
+            "turn":       self.memory.turn_count + 1,
             "question":   user_message
         })
 
-        self.messages.append({"role": "user", "content": user_message})
-
         for iteration in range(1, MAX_ITERATIONS + 1):
-            console.print(f"\n[dim]── Iteration {iteration}/{MAX_ITERATIONS} [{self.provider.model_name}] ──[/dim]")
+            console.print(
+                f"\n[dim]── Iteration {iteration}/{MAX_ITERATIONS} "
+                f"[{self.provider.model_name}] "
+                f"| {len(self.memory.messages)} msgs in window ──[/dim]"
+            )
 
-            log.debug("agent.iteration", extra={
-                "session_id": self.session_id,
-                "turn_id":    turn_id,
-                "iteration":  iteration
-            })
+            # Summary is injected into the system prompt — not the message list
+            effective_system = self.memory.get_system(self.system)
 
-            response = self.provider.complete(self.system, self.messages, TOOL_DEFINITIONS)
+            response = self.provider.complete(
+                effective_system,
+                self.memory.messages,
+                TOOL_DEFINITIONS
+            )
 
             log.debug("llm.response", extra={
-                "session_id":       self.session_id,
-                "turn_id":          turn_id,
-                "iteration":        iteration,
-                "stop_reason":      response.stop_reason,
-                "tool_calls_count": len(response.tool_calls)
+                "session_id":  self.session_id,
+                "iteration":   iteration,
+                "stop_reason": response.stop_reason,
+                "tool_calls":  len(response.tool_calls)
             })
 
-            # ── Agent is done ──────────────────────────────────────────────
+            # ── Agent is done ──────────────────────────────────────────
             if response.stop_reason == "end_turn":
-                self.messages.append({
+                self.memory.add({
                     "role": "assistant", "text": response.text, "tool_calls": []
                 })
+                self.memory.increment_turn()
+                self.memory.maybe_compress()    # compress if window exceeded
+                self.memory.save()              # persist after every turn
+
                 log.info("turn.complete", extra={
                     "session_id": self.session_id,
-                    "turn_id":    turn_id,
-                    "iterations": iteration
+                    "turn":       self.memory.turn_count,
+                    "iterations": iteration,
+                    "window_size": len(self.memory.messages),
+                    "has_summary": bool(self.memory.summary)
                 })
                 return response.text or "Agent completed without a text response."
 
-            # ── Agent wants to use tools ───────────────────────────────────
+            # ── Agent wants to use tools ───────────────────────────────
             if response.stop_reason == "tool_use":
-                self.messages.append({
+                self.memory.add({
                     "role":       "assistant",
                     "text":       None,
                     "tool_calls": [
@@ -171,11 +193,8 @@ class SQLAgent:
 
                 for tc in response.tool_calls:
                     _display_tool_call(tc.name, tc.input)
-
                     log.info("tool.call", extra={
                         "session_id": self.session_id,
-                        "turn_id":    turn_id,
-                        "iteration":  iteration,
                         "tool":       tc.name,
                         "input":      tc.input
                     })
@@ -184,36 +203,19 @@ class SQLAgent:
                     result = dispatch_tool(tc.name, tc.input, self.conn, self.adapter)
                     _display_tool_result(tc.name, result)
 
-                    # Log result summary (not full data to keep logs readable)
                     if "error" in result:
                         log.warning("tool.error", extra={
                             "session_id": self.session_id,
-                            "turn_id":    turn_id,
-                            "tool":       tc.name,
-                            "error":      result["error"]
+                            "tool": tc.name, "error": result["error"]
                         })
                     elif tc.name == "execute_sql" and result.get("status") == "success":
                         log.info("sql.executed", extra={
                             "session_id":        self.session_id,
-                            "turn_id":           turn_id,
                             "row_count":         result.get("row_count"),
                             "execution_time_ms": result.get("execution_time_ms")
                         })
-                    elif result.get("status") == "rejected":
-                        log.info("sql.rejected", extra={
-                            "session_id": self.session_id,
-                            "turn_id":    turn_id,
-                            "message":    result.get("message")
-                        })
-                    else:
-                        log.debug("tool.result", extra={
-                            "session_id": self.session_id,
-                            "turn_id":    turn_id,
-                            "tool":       tc.name,
-                            "status":     "ok"
-                        })
 
-                    self.messages.append({
+                    self.memory.add({
                         "role":         "tool_result",
                         "tool_call_id": tc.id,
                         "tool_name":    tc.name,
@@ -222,27 +224,12 @@ class SQLAgent:
 
                 continue
 
-            log.error("agent.unexpected_stop", extra={
-                "session_id":  self.session_id,
-                "turn_id":     turn_id,
-                "stop_reason": response.stop_reason
-            })
             return f"Agent stopped unexpectedly (reason: {response.stop_reason})."
 
-        log.warning("agent.max_iterations", extra={
-            "session_id": self.session_id,
-            "turn_id":    turn_id,
-            "iterations": MAX_ITERATIONS
-        })
+        log.warning("agent.max_iterations", extra={"session_id": self.session_id})
         return f"Reached {MAX_ITERATIONS} iterations without completing. Try a more specific question."
 
     def reset(self) -> None:
         log.info("session.reset", extra={"session_id": self.session_id})
-        self.messages = []
+        self.memory.reset()
         console.print("[dim]Conversation history cleared.[/dim]")
-
-    def __del__(self):
-        try:
-            log.info("session.end", extra={"session_id": self.session_id})
-        except Exception:
-            pass
