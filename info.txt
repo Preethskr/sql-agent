@@ -1,0 +1,152 @@
+Anyone can query a database without knowing SQL.
+Business analyst persona — a non-technical user asks questions in plain English and gets answers from a company database (showcases accessibility/democratization of data)
+
+
+# Domain Specific Agent Vs General Purpose Agent
+The agent has tools like list_tables, search_tables_by_keyword, describe_table — and it reasons its way to the right tables step by step. No preprocessing needed.
+
+   ┌─────────────────────────────┬────────────────────────────────┬───────────────────────────────────────────┐
+  │                             │       V1 (your previous)       │         V2 (what we're building)          │
+  ├─────────────────────────────┼────────────────────────────────┼───────────────────────────────────────────┤
+  │ Schema                      │ Entire schema in system prompt │ Discovered dynamically via tools          │
+  ├─────────────────────────────┼────────────────────────────────┼───────────────────────────────────────────┤
+  │ Context usage               │ Burns tokens upfront           │ Fetches only what's needed                │
+  ├─────────────────────────────┼────────────────────────────────┼───────────────────────────────────────────┤
+  │ Works with 50+ tables       │ No — hits context limits       │ Yes                                       │
+  ├─────────────────────────────┼────────────────────────────────┼───────────────────────────────────────────┤
+  │ Reasoning visible           │ No                             │ Yes — every tool call is a reasoning step │
+  ├─────────────────────────────┼────────────────────────────────┼───────────────────────────────────────────┤
+  │ Adaptable to schema changes │ No — prompt needs updating     │ Yes — tools query live schema             │
+  └─────────────────────────────┴────────────────────────────────┴───────────────────────────────────────────┘
+
+  - If the query already has a LIMIT clause → respect it
+  - If no LIMIT → inject LIMIT 1000 automatically
+  - Tell the agent in the system prompt: "Results are capped at 1000 rows. If the user needs aggregations, write aggregate
+  SQL rather than fetching raw rows."
+
+ Your complete tool specification:
+
+  ---
+  list_schemas
+
+  Description: Lists all schemas in the database
+  Input:        none
+  Returns:      ["logistics", "finance", "hr"]
+  Use case:     Always the first call — orients the agent
+
+  ---
+  list_tables
+
+  Description: Lists all tables within a given schema
+  Input:        schema_name (str)
+  Returns:      ["orders", "shipments", "customers", ...]
+  Use case:     After identifying relevant schema
+
+  ---
+  get_columns_with_types
+
+  Description: Returns column names, data types, nullability,
+               primary keys, and foreign key references for a table
+  Input:        schema_name (str), table_name (str)
+  Returns:      [
+                  { column: "order_id",    type: "INT",       pk: true,  fk: null },
+                  { column: "customer_id", type: "INT",       pk: false, fk: "customers.id" },
+                  { column: "status",      type: "VARCHAR",   pk: false, fk: null },
+                  { column: "created_at",  type: "TIMESTAMP", pk: false, fk: null }
+                ]
+  Use case:     Understand structure before writing SQL
+                FK info tells agent how to JOIN tables
+
+  ---
+  get_column_unique_values
+
+  Description: Returns distinct values for a column — intended for
+               low-cardinality categoricals (status, type, region etc.)
+  Input:        schema_name (str), table_name (str), column_name (str)
+  Returns:      ["PENDING", "IN_TRANSIT", "DELIVERED", "DAMAGED", "RETURNED"]
+  Guardrail:    If distinct count > 50, return a warning instead:
+                "High cardinality column — 3,204 unique values. Not suitable for filtering by value."
+  Use case:     Prevent wrong filter values in WHERE clauses
+
+  ---
+  execute_sql
+
+  Description: Executes a read-only SQL SELECT query
+  Input:        sql (str)
+  Returns:      On success → { columns: [...], rows: [...], row_count: int, execution_time_ms: int }
+                On error   → { error: "...", sql_attempted: "..." }
+
+  Guardrails:
+    - Read-only enforcement: parse for INSERT/UPDATE/DELETE/DROP/TRUNCATE
+                             → Prompt user for approval if detected (call request_human_approval tool)
+    - Row limit:             inject LIMIT 1000 if no LIMIT present
+    - Timeout:               10 second query timeout
+    - On error:              return error message as data (not exception)
+                             agent reads it and retries — up to 3 attempts
+
+  ---
+  request_human_approval (for write operations)
+
+  Description: Surfaces a write query to the user for approval
+               before execution
+  Input:        sql (str), reason (str)
+  Returns:      { approved: true/false, feedback: "..." }
+  Use case:     Any UPDATE/INSERT the agent determines is needed
+                Human sees the exact SQL before it runs
+
+  How does the agent know when to call which tool? That's the system prompt's job.
+
+    Your code scans the SQL:
+    ├── If SELECT → execute directly → return results
+    └── If INSERT/UPDATE/DELETE → STOP
+                                   Show user the SQL
+                                   Ask "Do you approve this? Y/N"
+                                   ├── Y → execute → return results
+                                   └── N → cancel → tell agent user rejected
+
+  1. "Where is the data?"           → call list_schemas
+  2. "Which schema?"                → call list_tables(schema_name)
+  3. "Which table?"                 → reason about table names vs the question
+  4. "What relevant columns?"       → call get_columns_with_types(schema, table)
+  5. "Need to combine tables?"      → check FK relationships from get_columns_with_types
+  6. "Any categorical filters?"     → call get_column_unique_values(schema, table, column)
+  7. "Need to aggregate?"           → reason about COUNT, SUM, AVG, GROUP BY
+  8. "Generate SQL"                 → write the query
+  9. "Execute"                      → call execute_sql(sql) Data
+
+
+  Layer 1: REASONING    → think about the problem, plan the approach
+  Layer 2: EXECUTION    → use tools, run SQL
+  Layer 3: OUTPUT       → format and present results
+
+  So the full structure is:
+
+  1. PERSONA              → who the agent is -> SQL Expert Agent
+  2. TOOLS                → what it has access to -> list_schemas, list_tables, get_columns_with_types, get_column_unique_values, execute_sql, request_human_approval
+  3. REASONING STEPS      → how it thinks -> Get Schema --> List Tables --> Identify Relevant Table (LLM) --> Get Column with types --> Identify FKs → Need any Join? -->Get unique values for filters → Write SQL --> Verify Read only --> If not human approval request --> Execute SQL __> Stop after failure, stop after success, stop after user reject insert/update/delete, ask them what to do instead?--> Perform error handling -->Summarize and show user
+  4. QUERY SAFETY CHECK   → SELECT → execute | Write → human approval
+  5. ERROR HANDLING       → retry 3x → tell user clearly
+  6. GUARDRAILS           → hard boundaries:
+                              - Row limit cap (1000)
+                              - Schema not accessible
+                              - Table not found
+                              - Column not found
+                              - No data returned
+                              - Ambiguous question
+                              - Question unrelated to database
+  7. OUTPUT FORMAT        → Answer + SQL + Results
+  8. STOPPING CONDITION   → when the agent stops the loop
+
+  As conversation grows longer, token usage grows. For a demo this is fine. In production you'd add:
+  - Summarization of old turns
+  - Sliding window (keep last N turns)
+  - Cost monitoring
+
+
+  - Dynamic system prompt loaded at runtime with injected variables
+  - Pure agentic tool-use loop — agent discovers schema step by step
+  - Stateful conversation — follow-up questions work naturally
+  - Human-in-the-loop for write operations — intercepted at code level
+  - Guardrails: row cap, timeout, cardinality check, error recovery with 3 retries
+  - Clean separation: config / tools / agent / UI — each file does one thing
+
